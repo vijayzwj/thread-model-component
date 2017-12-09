@@ -1,0 +1,143 @@
+放入方法
+
+List  buffer;
+
+int   bufferSize=512;
+
+public void put(Event event){
+
+     synchronized (buffer) {
+      while (true) {
+        int previousSize = buffer.size();
+
+        if (previousSize < bufferSize) {
+          buffer.add(event);
+
+          //
+          //   if buffer had been empty
+          //       signal all threads waiting on buffer
+          //       to check their conditions.
+          //
+          if (previousSize == 0) {
+            buffer.notifyAll();
+          }
+
+          break;
+        }
+
+        //
+        //   Following code is only reachable if buffer is full
+        //
+        //
+        //   if blocking and thread is not already interrupted
+        //      and not the dispatcher then
+        //      wait for a buffer notification
+        boolean discard = true;
+        if (blocking
+                && !Thread.interrupted()
+                && Thread.currentThread() != dispatcher) {
+          try {
+            buffer.wait();
+            discard = false;
+          } catch (InterruptedException e) {
+            //
+            //  reset interrupt status so
+            //    calling code can see interrupt on
+            //    their next wait or sleep.
+            Thread.currentThread().interrupt();
+          }
+        }
+
+        //
+        //   if blocking is false or thread has been interrupted
+        //   add event to discard map.
+        //
+        if (discard) {
+          String loggerName = event.getLoggerName();
+          DiscardSummary summary = (DiscardSummary) discardMap.get(loggerName);
+
+          if (summary == null) {
+            summary = new DiscardSummary(event);
+            discardMap.put(loggerName, summary);
+          } else {
+            summary.add(event);
+          }
+
+          break;
+        }
+      }
+    }
+
+}
+****消费线程
+public void run() {
+      boolean isActive = true;
+
+      //
+      //   if interrupted (unlikely), end thread
+      //
+      try {
+        //
+        //   loop until the AsyncAppender is closed.
+        //
+        while (isActive) {
+          LoggingEvent[] events = null;
+
+          //
+          //   extract pending events while synchronized
+          //       on buffer
+          //
+          synchronized (buffer) {
+            int bufferSize = buffer.size();
+            isActive = !parent.closed;
+
+            while ((bufferSize == 0) && isActive) {
+              buffer.wait();
+              bufferSize = buffer.size();
+              isActive = !parent.closed;
+            }
+
+            if (bufferSize > 0) {
+              events = new LoggingEvent[bufferSize + discardMap.size()];
+              buffer.toArray(events);
+
+              //
+              //   add events due to buffer overflow
+              //
+              int index = bufferSize;
+
+              for (
+                Iterator iter = discardMap.values().iterator();
+                  iter.hasNext();) {
+                events[index++] = ((DiscardSummary) iter.next()).createEvent();
+              }
+
+              //
+              //    clear buffer and discard map
+              //
+              buffer.clear();
+              discardMap.clear();
+
+              //
+              //    allow blocked appends to continue
+              buffer.notifyAll();
+            }
+          }
+
+          //
+          //   process events after lock on buffer is released.
+          //
+          if (events != null) {
+            for (int i = 0; i < events.length; i++) {
+              synchronized (appenders) {
+                appenders.appendLoopOnAppenders(events[i]);
+              }
+            }
+          }
+        }
+      } catch (InterruptedException ex) {
+        Thread.currentThread().interrupt();
+      }
+    }
+
+
